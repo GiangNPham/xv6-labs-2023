@@ -315,7 +315,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,19 +324,33 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    if (flags & PTE_W){
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+      sfence_vma();
+      flags = (flags& ~PTE_W) | PTE_COW;
     }
+
+    incref(pa);
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      panic("uvmcopy: mappages failed");
+    }
+
+
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    //   kfree(mem);
+    //   goto err;
+    // }
   }
   return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
+//  err:
+//   uvmunmap(new, 0, i / PGSIZE, 1);
+//   return -1;
 }
 
 // mark a PTE invalid for user access.
@@ -366,9 +380,36 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+    
+    if (pte == 0) return -1;
+
+    uint flags = PTE_FLAGS(*pte);
+    if ((flags & PTE_V) == 0 || (flags & PTE_U) == 0) return -1;
+    
+    if (((flags & PTE_W) == 0) && (flags & PTE_COW)) {
+      uint64 oldpa = PTE2PA(*pte);
+      int ref = getref(oldpa);
+
+      if (ref > 1){
+        char * mem = kalloc();
+        if (mem == 0) return -1;
+        memmove(mem, (char*) oldpa, PGSIZE);
+        kfree((void*) oldpa);
+
+        flags = (flags | PTE_W) & ~PTE_COW;
+        *pte = PA2PTE((uint64)mem) | flags | PTE_V;
+      } 
+      else {
+        *pte = (*pte | PTE_W) & ~PTE_COW;
+      }
+      
+      sfence_vma();
+    }
+    else if ((flags & PTE_W) == 0 && !(flags & PTE_COW)){
       return -1;
+    }
+    
+
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
     if(n > len)
@@ -448,4 +489,80 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+static void vmprint1(pagetable_t pt, int level) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pt[i];
+    if (pte & PTE_V) {
+      uint64 pa = PTE2PA(pte);
+      // indent
+      for (int d = 2; d > level; d--) printf(" ");
+      printf("..[%d] pte=%p pa=%p flags=", i, (void*)pte, (void*)pa);
+      if (pte & PTE_U) printf("U");
+      if (pte & PTE_R) printf("R");
+      if (pte & PTE_W) printf("W");
+      if (pte & PTE_X) printf("X");
+      printf("\n");
+      // if not a leaf, descend (leaf if any of R/W/X set)
+      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+        vmprint1((pagetable_t)pa, level-1);
+      }
+    }
+  }
+}
+#if defined(LAB_PGTBL) || defined(SOL_MMAP) || defined(SOL_COW)
+void
+vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprint1(pagetable, 2);
+}
+#endif
+
+
+int cowfault(pagetable_t pagetable, uint64 va){
+  // create new physical page with kalloc()
+  // set the new page with PTE_W
+
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  uint64 va_aligned = PGROUNDDOWN(va);
+  if (va_aligned >= MAXVA) return -1;
+
+  pte = walk(pagetable, va_aligned, 0);
+  if (pte == 0) return -1;
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  if ((flags & PTE_U) == 0) return -1;
+  if ((flags & PTE_COW) == 0) return -1;
+
+  int ref = getref(pa);
+  if (ref < 1)
+    panic("cowfault: bad ref");
+  
+  if (ref > 1){
+    if((mem = kalloc()) == 0)
+      return -1;
+    
+    // copy the content from the original page to the new page
+    memmove(mem, (char*)pa, PGSIZE);
+
+    // remove the old physical page
+    kfree((void*) pa);
+
+    flags = (flags | PTE_W) & ~PTE_COW; 
+
+    // set the PTE to point to the new physical address
+    *pte = PA2PTE((uint64)mem) | (flags & ~PTE_V) | PTE_V;
+  }
+  else {
+    *pte = (*pte | PTE_W) & ~PTE_COW;
+  }
+  sfence_vma(va_aligned);
+  return 0;
 }

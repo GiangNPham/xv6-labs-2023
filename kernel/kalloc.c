@@ -21,7 +21,13 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  int refcnt[(PHYSTOP - KERNBASE) / PGSIZE];
 } kmem;
+
+static inline int
+pa2idx(uint64 pa){
+  return (pa - KERNBASE) / PGSIZE;
+}
 
 void
 kinit()
@@ -52,11 +58,19 @@ kfree(void *pa)
     panic("kfree");
 
   // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+  // memset(pa, 1, PGSIZE);
+  acquire(&kmem.lock);
+
+  int idx = pa2idx((uint64)pa);
+  if (kmem.refcnt[idx] > 1){
+    kmem.refcnt[idx]--;
+    release(&kmem.lock);
+    return;
+  }
 
   r = (struct run*)pa;
+  kmem.refcnt[idx] = 0;
 
-  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
@@ -73,10 +87,32 @@ kalloc(void)
   acquire(&kmem.lock);
   r = kmem.freelist;
   if(r)
+    // freelist is a linked list of free pages
+    // pop the first page and then move the freelist's head
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
+    acquire(&kmem.lock);
+    kmem.refcnt[pa2idx((uint64)r)] = 1;
+    release(&kmem.lock);
+  }
   return (void*)r;
+}
+
+
+
+void incref(uint64 pa){
+  acquire(&kmem.lock);
+  kmem.refcnt[pa2idx(pa)]++;
+  release(&kmem.lock);
+}
+
+int getref(uint64 pa){
+  int r;
+  acquire(&kmem.lock);
+  r = kmem.refcnt[pa2idx(pa)];
+  release(&kmem.lock);
+  return r;
 }
